@@ -2,7 +2,7 @@
 // @name         AIHub Smart Group
 // @name:zh-CN   AIHub 智能分组
 // @namespace    local.aihub.smart-group
-// @version      0.16.0
+// @version      0.16.1
 // @description  Recommend reliable low-cost groups on AIHub.
 // @description:zh-CN 按价格、速度和可用性推荐 AIHub 分组
 // @license      MIT
@@ -32,7 +32,7 @@
 
   const ROOT_ID = 'aihub-smart-group-panel';
   const TOGGLE_ID = 'aihub-smart-group-toggle';
-  const SCRIPT_VERSION = '0.16.0';
+  const SCRIPT_VERSION = '0.16.1';
   const STORAGE_PREFIX = 'aihub-smart-group:';
   const CONFIG_CHANGE_EVENT = 'aihub-smart-group:config-changed';
   const ROUTER_REPLACE_EVENT = 'aihub-smart-group:router-replace';
@@ -652,11 +652,19 @@
       })).filter((card) => card.model);
   }
 
+  function getSupportedModels(row) {
+    const declared = row?.groupModels ?? row?.group_models;
+    // A missing support list is different from an explicitly empty list.
+    const models = Array.isArray(declared)
+      ? declared
+      : normalizeModelCards(row?.modelCards ?? row?.model_cards);
+    return normalizeRequiredModels(models.map((item) => typeof item === 'string' ? item : item?.model));
+  }
+
   function getRequiredModelsBlockReason(row, models, now = Date.now()) {
     const required = normalizeRequiredModels(models);
     if (!required.length) return '';
-    const supported = normalizeRequiredModels((row?.groupModels ?? row?.group_models ?? [])
-      .map((item) => typeof item === 'string' ? item : item?.model));
+    const supported = getSupportedModels(row);
     const cards = normalizeModelCards(row?.modelCards ?? row?.model_cards);
     for (const model of required) {
       if (!supported.includes(model)) return 'unsupported';
@@ -1597,8 +1605,7 @@
       group_id: groupId,
       planType: String(source.planType ?? source.code ?? source.name ?? `Group ${source.group_id ?? ''}`),
       platform: normalizePlatform(source.platform),
-      groupModels: normalizeRequiredModels((Array.isArray(source.groupModels ?? source.group_models) ? (source.groupModels ?? source.group_models) : [])
-        .map((item) => typeof item === 'string' ? item : item?.model)),
+      groupModels: getSupportedModels(source),
       modelCards: normalizeModelCards(source.modelCards ?? source.model_cards),
       priceMultiplier: source.priceMultiplier ?? source.rate_multiplier ?? source.rateMultiplier,
       available: source.available,
@@ -2053,6 +2060,50 @@
       counts.eligible += 1;
     }
     return { candidates, counts, signature, sourceRows };
+  }
+
+  function getGroupRecommendationDiagnostic(row, config = DEFAULT_CONFIG) {
+    const normalized = normalizeConfig(config);
+    if (!row) return { code: 'missing', text: '监控数据中未找到当前分组' };
+    const { counts, candidates } = analyzeCandidates([row], normalized);
+    const modelLabels = { unsupported: '未声明支持所选模型', failed: '所选模型健康检查失败', unknown: '所选模型健康数据缺失、证据不足或探测未启用', stale: '所选模型健康数据过期或时间无效' };
+    const reasons = [
+      ['platformExcluded', '不属于所选模型平台'],
+      ['invalid', '分组编号或标称倍率无效'],
+      ['unavailable', '分组不可用、停用或未在大厅展示'],
+      ['requiredModelExcluded', modelLabels[getRequiredModelsBlockReason(row, normalized.requiredModels)]],
+      ['lowSuccess', normalized.availabilityMode === 'consecutive'
+        ? '连续成功点数 ' + (row.recentConsecutiveSuccessCount ?? 0) + '/' + normalized.minConsecutiveSuccesses10m
+        : normalized.availabilityMode === 'successes'
+          ? '成功点数 ' + (row.recentSuccessCount ?? 0) + '/' + normalized.minSuccessPoints10m
+          : '10m 可用率 ' + formatPercent(row.successRates?.['10m']) + '，低于 ' + formatPercent(normalized.minSuccess10m)],
+      ['warnings', '存在监控警告或模型检测异常'],
+      ['keywords', '命中排除关键词'],
+      ['slaUnavailable', '缺少 SLA 数据'],
+      ['slaLow', formatSla(row.sla) + '，低于 ' + formatPercent(normalized.minSla)],
+      ['outputTpsUnavailable', '缺少有效输出速度'],
+      ['outputTpsLow', formatOutputThroughput(row) + '，低于 ' + normalized.minOutputTokensPerSecond + ' tok/s'],
+      ['priceMetricUnavailable', RECOMMENDATION_PRICE_BASIS_LABELS[normalized.recommendationPriceBasis] + '不可用：' + formatRecommendationPriceUnavailableReasons(counts.priceMetricUnavailableReasons)],
+    ];
+    const excluded = reasons.find(([code]) => counts[code] > 0);
+    if (excluded) return { code: excluded[0] + (excluded[0] === 'requiredModelExcluded' ? ':' + getRequiredModelsBlockReason(row, normalized.requiredModels) : ''), text: excluded[1] };
+    if (normalized.mode === 'balance' && candidates[0]?.price > normalized.balanceMaxPrice) {
+      return { code: 'overLimit', text: '标称倍率超过平衡上限 ' + formatMultiplier(normalized.balanceMaxPrice) };
+    }
+    return { code: 'eligible', text: '符合筛选条件；按当前' + GROUP_MODE_LABELS[normalized.mode] + '策略比较后未排第一' };
+  }
+
+  function formatRecommendationDiagnosticMetrics(row, config = DEFAULT_CONFIG) {
+    const normalized = normalizeConfig(config);
+    const basis = normalized.mode === 'price' ? normalized.recommendationPriceBasis : 'nominal';
+    const metric = getRecommendationPriceMetric(row, basis);
+    return [
+      metric.available
+        ? formatRecommendationPriceCriterion({ ...row, rankingPriceBasis: basis, rankingPriceValue: metric.value })
+        : RECOMMENDATION_PRICE_BASIS_LABELS[basis] + '不可用（' + (RECOMMENDATION_PRICE_UNAVAILABLE_REASON_LABELS[metric.reason] || '缺失') + '）',
+      formatOutputThroughput(row),
+      formatLatencyMetric(row, normalized.latencySource, normalized.minUserTtftSamples),
+    ].filter(Boolean).join(' · ');
   }
 
   function getEligibleCandidates(rows, normalizedConfig) {
@@ -3599,6 +3650,7 @@
       this.lastRefreshCompletedAt = 0;
       this.keySelectSignature = '';
       this.lastDetectionLogSignature = null;
+      this.lastGroupDiagnosticSignature = null;
       this.lastMonitorStaleLogState = null;
       this.lastSeriesFallbackLogState = null;
       this.lastAuthLogSignature = '';
@@ -4285,9 +4337,24 @@
         this.lastUpdated = new Date();
         this.error = '';
         this.renderData();
+        const currentKey = this.selectedKey();
+        const currentRow = this.rows.find((row) => Number(row.group_id) === currentKey?.groupId);
+        if (currentKey && currentKey.groupId !== winner?.groupId) {
+          const diagnostic = getGroupRecommendationDiagnostic(currentRow, this.config);
+          const diagnosticSignature = JSON.stringify([strategySignature, currentKey.id, currentKey.groupId, winner?.groupId, diagnostic.code]);
+          if (shouldLogTransition(this.lastGroupDiagnosticSignature, diagnosticSignature, forceLog)) {
+            this.log('info', '当前分组 ' + currentKey.groupName + '：' + diagnostic.text);
+            if (currentRow) this.log('info', '当前分组指标：' + formatRecommendationDiagnosticMetrics(currentRow, this.config));
+            if (this.config.requiredModels.length) this.log('info', '模型要求：' + this.config.requiredModels.join('、'));
+          }
+          this.lastGroupDiagnosticSignature = diagnosticSignature;
+        } else {
+          this.lastGroupDiagnosticSignature = null;
+        }
         const detectionSignature = `${strategySignature}:${winner?.groupId ?? 'none'}`;
         if (shouldLogTransition(this.lastDetectionLogSignature, detectionSignature, forceLog)) {
           this.log('info', `检测完成，推荐${winner?.name || '暂无分组'}`);
+          if (winner) this.log('info', '推荐分组指标：' + formatRecommendationDiagnosticMetrics(winner, this.config));
         }
         this.lastDetectionLogSignature = detectionSignature;
         if (this.lastErrorLogSignature) this.log('info', '监控检测已恢复');
@@ -4452,6 +4519,7 @@
         storageSet('lastSwitch', this.lastSwitch);
         this.setStatus(`已切换到 ${winner.name}`);
         this.log('info', `已切换到${winner.name}`);
+        this.log('info', '切换时推荐指标：' + formatRecommendationDiagnosticMetrics(winner, this.config));
         this.renderData();
         this.syncUiTimer();
         return true;
@@ -6466,7 +6534,10 @@
     hasModelDetectionWarning,
     normalizeRequiredModels,
     normalizeModelCards,
+    getSupportedModels,
     getRequiredModelsBlockReason,
+    getGroupRecommendationDiagnostic,
+    formatRecommendationDiagnosticMetrics,
     normalizePanelTab,
     getLatencyMetric,
     getUserLatencySampleCount,
