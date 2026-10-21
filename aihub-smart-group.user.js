@@ -6,8 +6,9 @@
 // @description  Recommend reliable low-cost groups on AIHub.
 // @description:zh-CN 按价格、速度和可用性推荐 AIHub 分组
 // @license      MIT
-// @homepageURL   https://github.com/jwwsjlm/AIHub-Smart-Group
-// @supportURL    https://github.com/jwwsjlm/AIHub-Smart-Group/issues
+// @homepageURL https://github.com/fz999999/aihub
+// @supportURL  https://github.com/fz999999/aihub/issues
+// @match        https://aihub.dog/*
 // @match        https://aihub.top/*
 // @grant        GM_addStyle
 // @grant        GM_getValue
@@ -16,8 +17,8 @@
 // @grant        GM_unregisterMenuCommand
 // @grant        unsafeWindow
 // @run-at       document-idle
-// @downloadURL https://update.greasyfork.org/scripts/587603/AIHub%20Smart%20Group.user.js
-// @updateURL https://update.greasyfork.org/scripts/587603/AIHub%20Smart%20Group.meta.js
+// @downloadURL https://raw.githubusercontent.com/fz999999/aihub/main/aihub-smart-group.user.js
+// @updateURL   https://raw.githubusercontent.com/fz999999/aihub/main/aihub-smart-group.user.js
 // ==/UserScript==
 
 /* global module, GM_unregisterMenuCommand */
@@ -6479,7 +6480,7 @@
     appendLogEntries,
     formatLogLine,
     start() {
-      if (location.hostname !== 'aihub.top') return;
+      if (!['aihub.dog', 'aihub.top'].includes(location.hostname)) return;
       activeRouter?.stop();
       document.dispatchEvent(new window.Event(ROUTER_REPLACE_EVENT));
       activeRouter = new AppRouter();
