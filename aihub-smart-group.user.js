@@ -2,7 +2,7 @@
 // @name         AIHub Smart Group
 // @name:zh-CN   AIHub 智能分组
 // @namespace    local.aihub.smart-group
-// @version      0.15.0
+// @version      0.16.0
 // @description  Recommend reliable low-cost groups on AIHub.
 // @description:zh-CN 按价格、速度和可用性推荐 AIHub 分组
 // @license      MIT
@@ -32,7 +32,7 @@
 
   const ROOT_ID = 'aihub-smart-group-panel';
   const TOGGLE_ID = 'aihub-smart-group-toggle';
-  const SCRIPT_VERSION = '0.15.0';
+  const SCRIPT_VERSION = '0.16.0';
   const STORAGE_PREFIX = 'aihub-smart-group:';
   const CONFIG_CHANGE_EVENT = 'aihub-smart-group:config-changed';
   const ROUTER_REPLACE_EVENT = 'aihub-smart-group:router-replace';
@@ -312,6 +312,7 @@
     autoSwitch: false,
     mode: 'price',
     platformFilter: 'openai',
+    requiredModels: [],
     balanceMaxPrice: 0.1,
     excludedGroupKeywords: '',
     maxMonitorAgeSeconds: 600,
@@ -539,6 +540,7 @@
       autoSwitch: source.autoSwitch === true,
       mode: normalizeGroupMode(source.mode),
       platformFilter: normalizePlatformFilter(source.platformFilter),
+      requiredModels: normalizeRequiredModels(source.requiredModels),
       balanceMaxPrice: clamp(numberOr(source.balanceMaxPrice, DEFAULT_CONFIG.balanceMaxPrice), 0, 1000),
       excludedGroupKeywords: normalizeExcludedGroupKeywords(source.excludedGroupKeywords),
       maxMonitorAgeSeconds: DEFAULT_CONFIG.maxMonitorAgeSeconds,
@@ -586,6 +588,7 @@
         : normalizedConfig.minSuccess10m;
     return {
       platformFilter: normalizedConfig.platformFilter,
+      requiredModels: normalizedConfig.requiredModels,
       availabilityMode: normalizedConfig.availabilityMode,
       availabilityThreshold,
       minSla: normalizedConfig.minSla,
@@ -631,6 +634,44 @@
   function matchesPlatformFilter(row, filter) {
     const normalizedFilter = normalizePlatformFilter(filter);
     return normalizedFilter === 'all' || normalizePlatform(row?.platform) === normalizedFilter;
+  }
+
+  function normalizeRequiredModels(value) {
+    return [...new Set((Array.isArray(value) ? value : [])
+      .filter((model) => typeof model === 'string')
+      .map((model) => model.trim().toLowerCase()).filter(Boolean))].sort();
+  }
+
+  function normalizeModelCards(value) {
+    return (Array.isArray(value) ? value : []).filter((card) => card && typeof card === 'object')
+      .map((card) => ({
+        model: String(card.model ?? '').trim().toLowerCase(),
+        health: String(card.health ?? '').trim().toLowerCase(),
+        probeState: String(card.probeState ?? card.probe_state ?? '').trim().toLowerCase(),
+        expiresAt: card.expiresAt ?? card.health_expires_at ?? null,
+      })).filter((card) => card.model);
+  }
+
+  function getRequiredModelsBlockReason(row, models, now = Date.now()) {
+    const required = normalizeRequiredModels(models);
+    if (!required.length) return '';
+    const supported = normalizeRequiredModels((row?.groupModels ?? row?.group_models ?? [])
+      .map((item) => typeof item === 'string' ? item : item?.model));
+    const cards = normalizeModelCards(row?.modelCards ?? row?.model_cards);
+    for (const model of required) {
+      if (!supported.includes(model)) return 'unsupported';
+      const matches = cards.filter((card) => card.model === model);
+      if (!matches.length) return 'unknown';
+      for (const card of matches) {
+        if (card.probeState && card.probeState !== 'enabled') return 'unknown';
+        if (card.health !== 'healthy') return card.health === 'failed' ? 'failed' : 'unknown';
+        if (card.expiresAt != null) {
+          const expiry = Date.parse(card.expiresAt);
+          if (!Number.isFinite(expiry) || expiry <= now) return 'stale';
+        }
+      }
+    }
+    return '';
   }
 
   function normalizePanelTab(value) {
@@ -1556,6 +1597,9 @@
       group_id: groupId,
       planType: String(source.planType ?? source.code ?? source.name ?? `Group ${source.group_id ?? ''}`),
       platform: normalizePlatform(source.platform),
+      groupModels: normalizeRequiredModels((Array.isArray(source.groupModels ?? source.group_models) ? (source.groupModels ?? source.group_models) : [])
+        .map((item) => typeof item === 'string' ? item : item?.model)),
+      modelCards: normalizeModelCards(source.modelCards ?? source.model_cards),
       priceMultiplier: source.priceMultiplier ?? source.rate_multiplier ?? source.rateMultiplier,
       available: source.available,
       enabled: source.enabled ?? source.status !== 'disabled',
@@ -1912,6 +1956,8 @@
     const counts = {
       total: sourceRows.length,
       platformExcluded: 0,
+      requiredModelExcluded: 0,
+      requiredModelReasons: { unsupported: 0, failed: 0, unknown: 0, stale: 0 },
       invalid: 0,
       unavailable: 0,
       lowSuccess: 0,
@@ -1941,6 +1987,12 @@
       }
       if (row.enabled === false || row.visibleInHall === false || row.available !== true) {
         counts.unavailable += 1;
+        continue;
+      }
+      const modelBlockReason = getRequiredModelsBlockReason(row, normalizedConfig.requiredModels);
+      if (modelBlockReason) {
+        counts.requiredModelExcluded += 1;
+        counts.requiredModelReasons[modelBlockReason] += 1;
         continue;
       }
       const success10m = nonNegativeNumberOrNull(row.successRates?.['10m']);
@@ -3659,6 +3711,9 @@
             <select id="asg-mode-select" data-field="mode"><option value="price">价格（最低价格）</option><option value="balance">平衡（倍率上限内延迟最快）</option><option value="speed">速度（TTFT 最快）</option></select>
             <label for="asg-platform-select">模型平台</label>
             <select id="asg-platform-select" data-field="platform"><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option><option value="zhipu">GLM</option><option value="kimi">Kimi</option><option value="all">全部平台（混合比较）</option></select>
+            <label for="asg-models-select">必需模型（选中的模型必须全部可用）</label>
+            <select id="asg-models-select" data-field="required-models" multiple size="4" aria-describedby="asg-models-help"></select>
+            <div id="asg-models-help" class="asg-muted">不选则不限模型；按住 Ctrl / ⌘ 多选或取消。仅保留支持全部所选模型且模型健康、未过期的分组。</div>
             <div class="asg-recommend" data-field="recommend"><div class="asg-muted">正在读取监控数据...</div></div>
             <label for="asg-key-select">目标密钥</label>
             <select id="asg-key-select" data-field="key"></select>
@@ -3830,8 +3885,18 @@
           this.lastAutoSkipLogSignature = '';
         }
         storageSet('config', this.config);
+        this.syncRequiredModelOptions();
         this.log('info', `模型平台改为${getPlatformLabel(this.config.platformFilter)}`);
         this.refresh();
+      });
+      this.panel.querySelector('[data-field="required-models"]').addEventListener('change', (event) => {
+        this.config.requiredModels = normalizeRequiredModels([...event.target.selectedOptions].map((option) => option.value));
+        this.stability = createStabilityState();
+        this.lastAutoSkipLogSignature = '';
+        storageSet('config', this.config);
+        this.renderActionState();
+        this.log('info', `必需模型：${this.config.requiredModels.join('、') || '不限'}`);
+        this.refresh(true);
       });
       this.panel.querySelector('[data-field="auto"]').addEventListener('change', (event) => {
         if (event.target.checked && !window.confirm('自动切换会在检测通过后修改选中 API 密钥的分组，是否启用？')) {
@@ -3895,7 +3960,30 @@
       }
     }
 
+    syncRequiredModelOptions() {
+      const select = this.panel?.querySelector('[data-field="required-models"]');
+      if (!select) return;
+      const selected = new Set(this.config.requiredModels);
+      const models = new Set(selected);
+      for (const row of this.summaryRows) {
+        if (!matchesPlatformFilter(row, this.config.platformFilter)) continue;
+        for (const model of row.groupModels || []) models.add(model);
+      }
+      const signature = JSON.stringify([[...models].sort(), [...selected].sort()]);
+      if (select.dataset.signature === signature) return;
+      const options = [...models].sort().map((model) => {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model;
+        option.selected = selected.has(model);
+        return option;
+      });
+      select.replaceChildren(...options);
+      select.dataset.signature = signature;
+    }
+
     syncSettingsInputs() {
+      this.syncRequiredModelOptions();
       for (const input of this.panel.querySelectorAll('[data-setting]')) {
         const key = input.dataset.setting;
         if (input.type === 'checkbox') input.checked = this.config[key] === true;
@@ -4059,6 +4147,7 @@
       next.autoSwitch = this.config.autoSwitch;
       next.mode = this.config.mode;
       next.platformFilter = this.config.platformFilter;
+      next.requiredModels = this.config.requiredModels;
       this.config = normalizeConfig(next);
       if (getRecommendationStrategySignature(this.config) !== previousStrategy) {
         this.stability = createStabilityState();
@@ -4481,7 +4570,11 @@
       const platformText = this.config.platformFilter === 'all'
         ? '全部平台'
         : `${getPlatformLabel(this.config.platformFilter)}平台（其他平台 ${Number(diagnostics.platformExcluded) || 0} 个未参与）`;
-      diagnostic.textContent = `${platformText} · 参与比较 ${this.ranked.length} · 排除关键词 ${diagnostics.keywords || 0} · 不可用 ${diagnostics.unavailable || 0} · 可用率不足 ${diagnostics.lowSuccess || 0} · 监控警告 ${diagnostics.warnings || 0}${detectionWarnings ? `（模型检测异常 ${detectionWarnings}）` : ''}${slaUnavailable ? ` · SLA 无数据排除 ${slaUnavailable}` : ''}${slaLow ? ` · SLA 不足排除 ${slaLow}` : ''}${outputTpsUnavailable ? ` · 输出速度无数据排除 ${outputTpsUnavailable}` : ''}${outputTpsLow ? ` · 输出速度不足排除 ${outputTpsLow}` : ''}${userLatencySampleFallbacks ? ` · 真实用户样本不足回退 ${userLatencySampleFallbacks}` : ''}${priceUnavailable ? ` · 价格数据不可用 ${priceUnavailable}${priceUnavailableReasons ? `（${priceUnavailableReasons}）` : ''}` : ''}${overLimit ? ` · 超过倍率上限 ${overLimit}` : ''}`;
+      const modelReasons = diagnostics.requiredModelReasons || {};
+      const modelFilterText = this.config.requiredModels.length
+        ? ` · 必需模型 ${this.config.requiredModels.join('、')} · 模型限制排除 ${diagnostics.requiredModelExcluded || 0}（不支持 ${modelReasons.unsupported || 0} / 失败 ${modelReasons.failed || 0} / 无有效数据 ${modelReasons.unknown || 0} / 已过期 ${modelReasons.stale || 0}）`
+        : '';
+      diagnostic.textContent = `${platformText}${modelFilterText} · 参与比较 ${this.ranked.length} · 排除关键词 ${diagnostics.keywords || 0} · 不可用 ${diagnostics.unavailable || 0} · 可用率不足 ${diagnostics.lowSuccess || 0} · 监控警告 ${diagnostics.warnings || 0}${detectionWarnings ? `（模型检测异常 ${detectionWarnings}）` : ''}${slaUnavailable ? ` · SLA 无数据排除 ${slaUnavailable}` : ''}${slaLow ? ` · SLA 不足排除 ${slaLow}` : ''}${outputTpsUnavailable ? ` · 输出速度无数据排除 ${outputTpsUnavailable}` : ''}${outputTpsLow ? ` · 输出速度不足排除 ${outputTpsLow}` : ''}${userLatencySampleFallbacks ? ` · 真实用户样本不足回退 ${userLatencySampleFallbacks}` : ''}${priceUnavailable ? ` · 价格数据不可用 ${priceUnavailable}${priceUnavailableReasons ? `（${priceUnavailableReasons}）` : ''}` : ''}${overLimit ? ` · 超过倍率上限 ${overLimit}` : ''}`;
       recommend.appendChild(diagnostic);
       const freshness = document.createElement('div');
       freshness.className = `asg-monitor-age${this.monitorFreshness.stale ? ' asg-stale' : ''}`;
@@ -4493,6 +4586,7 @@
       this.renderBalance();
       const keyInfo = this.authError || (this.keyCount !== null ? `已读取 ${this.keyCount} 个密钥` : '');
       this.setStatus(this.error || keyInfo || (this.lastUpdated ? `最近检测：${this.lastUpdated.toLocaleTimeString()}` : '准备检测'), Boolean(this.error || this.authError));
+      this.syncRequiredModelOptions();
       this.renderKeys();
       this.renderCandidates();
       this.renderLogs();
@@ -6370,6 +6464,9 @@
     formatModelDetectionTitle,
     isModelDetectionWarning,
     hasModelDetectionWarning,
+    normalizeRequiredModels,
+    normalizeModelCards,
+    getRequiredModelsBlockReason,
     normalizePanelTab,
     getLatencyMetric,
     getUserLatencySampleCount,
